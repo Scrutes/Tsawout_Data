@@ -1,126 +1,124 @@
-
 library(tidyverse)
 library(tidyr)
 library(readxl)
 library(plotly)
 library(RColorBrewer)
 library(viridis)
+library(lubridate)
 
+# ── Load files ────────────────────────────────────────────────────────────────
+folder_path <- "Data_max/"
+files <- list.files(path = folder_path, full.names = TRUE, recursive = TRUE)
 
-# Location for your working directory. This is where you will keep your script and your files. 
-# We need  explicitly put the working directory here because this script is not part of a project. 
-# If you decide to make an R project the working directory will be automatically set to inside the project. 
-#setwd("C:/Users/ScrutonM/Documents/Projects/R/Tsawout")
+# Get serial numbers
+data_list_raw_sn <- lapply(files, read.csv, header = FALSE)
+serial_numbers   <- sapply(data_list_raw_sn, function(df) df[2, 1])
 
-# Name of excel sheet to input. I encourage you in the future to work from your raw outputs to get it 
-# into a joint format within R to eliminate a step outside of R and improve reproducability. 
-#raw_tide_data <- read_excel("AggregateData_20250929_R1.xlsx",col_types = c("date",rep("numeric",10)))
-
-##meow
-## test 1 2
-## fake news
-
-folder_path <- "Data/"
-files <- list.files(
-  path = folder_path,
-  full.names = TRUE,
-  recursive = TRUE
-)
-
-# data_list_raw <- lapply(files, function(f) {
-#   read.csv(f, header = FALSE)
-# })
-
-data_list_raw <- lapply(files, read.csv, header = FALSE)
-
-serial_numbers <- sapply(data_list_raw, function(df) df[2,1])
-
-#prefixed <- lapply(serial_numbers, function(x) {
-#  paste0("logger_", x)
-#})
-
-data_list <- lapply(data_list_raw, function(df) {
-  
-  # find first row where column 1 contains "Date"
-  start_row <- which(df[[1]] == "Date")[1]
-  
-  # keep everything from that row onward
-  df <- df[start_row:nrow(df), ]
-  
-  # reset row numbers
-  #rownames(df) <- NULL
-  return(df)
+# Read each file from the "Date," header row onward
+data_list_raw <- lapply(files, function(f) {
+  lines    <- readLines(f, warn = FALSE)
+  date_row <- which(grepl("^Date,", lines))[1]
+  read.csv(text = lines[date_row:length(lines)], header = TRUE)
 })
 
-file_list <- list()
+# ── Clean & type-cast each file ───────────────────────────────────────────────
+data_list <- lapply(data_list_raw, function(df) {
+  df$Date        <- as.Date(parse_date_time(df$Date, orders = c("mdy", "ymd")))
+  df$Time        <- as.character(df$Time)
+  df$ms          <- as.numeric(df$ms)
+  df$LEVEL       <- as.numeric(df$LEVEL)
+  df$TEMPERATURE <- as.numeric(df$TEMPERATURE)
+  df$Salinity    <- if ("Salinity" %in% colnames(df)) as.numeric(df$Salinity) else NA_real_
+  df
+})
 
-for (file in 1:length(data_list)){
-  
-  current_file <- data_list[[file]]
-  
-  current_sn <- serial_numbers[[file]]
-  
-  current_file <- current_file %>%
-    mutate(sn=current_sn)
-  
-  file_list[[file]] <- current_file
-    }
+# ── Add serial number column & combine ────────────────────────────────────────
+data_combined <- bind_rows(lapply(seq_along(data_list), function(i) {
+  data_list[[i]] %>% mutate(sn = as.character(serial_numbers[[i]]))
+}))
 
-# This is telling R to take the raw data and put it into long format.
-tide_data_long <- pivot_longer(raw_tide_data, names_to = "col_name", values_to = "value", cols = 2:11 )
+# ── Pivot to long format ──────────────────────────────────────────────────────
+tide_data_long <- data_combined %>%
+  pivot_longer(cols = c("LEVEL", "TEMPERATURE", "Salinity"),
+               names_to  = "col_name",
+               values_to = "value") %>%
+  mutate(
+    param_type = case_when(
+      col_name == "LEVEL"       ~ "Level (m)",
+      col_name == "TEMPERATURE" ~ "Water Temp (°C)",
+      col_name == "Salinity"    ~ "Salinity (PSU)",
+      TRUE                      ~ "Other"
+    ),
+    DateTime = ymd_hms(paste(Date, Time))
+  ) %>%
+  distinct()
 
-# The "mutate" function is for column creation. This new column "param_type" is getting its values 
-# by locating key words within the col_name column and determining what kind of param type it is. 
-tide_data_long <- tide_data_long %>%
-  mutate(param_type = ifelse(grepl("Level", col_name), "Level (m)", 
-                           ifelse(grepl("Air Temp", col_name), "Water Temp (°C)", 
-                                  ifelse(grepl("Average Temp", col_name), "Water Temp (°C)", 
-                                         ifelse(grepl("Salinity", col_name), "Salinity (PSU)", 
-                                                ifelse(grepl("Observed Tides",col_name), "Level (m)","Other"))))))
+# ── Hourly averages ───────────────────────────────────────────────────────────
+tide_hourly <- tide_data_long %>%
+  mutate(DateTime = floor_date(DateTime, unit = "hour")) %>%
+  group_by(DateTime, sn, col_name, param_type) %>%
+  summarise(value = mean(value, na.rm = TRUE), .groups = "drop")
 
+# ── !! EDIT READABLE NAMES HERE !! ───────────────────────────────────────────
+# Add or remove rows to match your serial numbers exactly.
+# Run unique(tide_hourly$sn) to see all your serial numbers first.
+sn_labels <- c(
+  "1093993" = "Station A",
+  "2188289" = "Station B",
+  "2190552" = "Station C", 
+  "1094001" = "Station D"
+  # add more as needed...
+)
 
-# This is getting the number of variables in your data set. 
-n_vars <- length(unique(tide_data_long$col_name))
-#this brute forces the line type for each data point. Note it isn't the same order as the legend, go look at the "unique(tide_data_long$col_name)" by using CTRL+ENTER.
-#could do this colours. See here https://sape.inf.usi.ch/quick-reference/ggplot2/colour.
-line_list <- c("solid","dot","solid","solid","solid","dot","solid","solid","dot","dash")
-colour_list <- c("green","green","turquoise","orange","blue","blue","purple","red","red","black")
+# Apply labels — any sn not in sn_labels will keep its raw serial number
+tide_hourly <- tide_hourly %>%
+  mutate(sn_label = ifelse(sn %in% names(sn_labels), sn_labels[sn], sn))
 
-# This is using the number of variables to automate a colour pallet. The viridis palette or RColourBrewer are good for palette creation. 
-# You can also create your own palette by just listing colour  names/hex names in a list where the plasma(xx) code is. 
-#pal <- setNames(viridis::plasma(n_vars, begin = 0, end = 0.92), unique(tide_data_long$col_name))
-pal <- setNames(colour_list,unique(tide_data_long$col_name))
-line <- setNames(line_list, unique(tide_data_long$col_name))
+# ── Colour & line-type palettes ───────────────────────────────────────────────
+valid_names <- unique(tide_hourly$sn_label)
+n_vars      <- length(valid_names)
 
+colour_list <- c("darkgreen", "turquoise", "orange", "blue", "purple", "red", "red", "black")
+line_list   <- c("solid", "solid",     "solid",  "dot",  "solid",  "solid","dot", "dash")
 
+pal  <- setNames(colour_list[1:n_vars], valid_names)
+line <- setNames(line_list[1:n_vars],   valid_names)
 
-# This code is a little complicated but pretty much it's creating a plotly plot for each 
-# param_type and then assigning colors based off the pals palette defined earlier.
-plots <- tide_data_long %>%
-  split(.$param_type) %>%
+# ── Build one plot per parameter ──────────────────────────────────────────────
+plots <- tide_hourly %>%
+  split(.$col_name) %>%
   lapply(function(df) {
-    plot_ly(
-      data = df,
-      type = 'scatter',
-      mode = 'lines',
-      x = ~`Date & Time`,
-      y = ~value,
-      color = ~col_name,   # differentiates within facet
-      colors = pal,
-      linetype = ~col_name,
-      linetypes = line
-    ) %>%
-      layout(
-        showlegend = TRUE,
-        xaxis = list(rangeslider = list(visible = TRUE), title = "Date"), 
-        yaxis = list(title = unique(df$param_type),range = c(0,max(df$value)))
+    
+    # Build traces manually so we can set opacity per trace
+    p <- plot_ly()
+    
+    for (station in unique(df$sn_label)) {
+      df_sub <- df %>% filter(sn_label == station)
+      p <- add_trace(p,
+                     data      = df_sub,
+                     type      = "scatter",
+                     mode      = "lines",
+                     x         = ~DateTime,
+                     y         = ~value,
+                     name      = station,
+                     line      = list(
+                       color = pal[[station]],
+                       dash  = line[[station]],
+                       width = 1.5
+                     ),
+                     opacity   = 0.8,
+                     legendgroup = station,
+                     showlegend  = !duplicated(unique(df$sn_label))[which(unique(df$sn_label) == station)]
       )
+    }
+    
+    p %>% layout(
+      xaxis = list(title = "Date", rangeslider = list(visible = TRUE)),
+      yaxis = list(title = unique(df$param_type),
+                   range = c(0, max(df$value, na.rm = TRUE)))
+    )
   })
 
-# This is grouping all the individual plots that were created in the last chunk of code and creating one cohesive plot.  
-other_plots <-subplot(plots, nrows = length(plots), shareX = TRUE, titleY = TRUE)
-
-#run this line to see the plot on the Viewer on the right. To see in big screen click on the Zoom button at the top of the Viewer panel. 
-other_plots
-
-
+# ── Combine into one stacked plot ─────────────────────────────────────────────
+subplot(plots, nrows = length(plots), shareX = TRUE, titleY = TRUE) %>%
+  layout(showlegend = TRUE)
